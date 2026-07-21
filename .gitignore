@@ -1,0 +1,25 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Order PDFs — these contain real customer names/emails/phone numbers, do not commit
+data/orders/*.pdf
+
+# Windows/WSL download marker files
+*:Zone.Identifier
+
+# Frontend (also has its own .gitignore under frontend/)
+frontend/node_modules/
+frontend/build/
+
+# OS / editor
+.DS_Store
+*.swp
