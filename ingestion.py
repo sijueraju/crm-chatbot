@@ -1,18 +1,15 @@
-# ingestion.py
-# Reads order PDFs from a directory, chunks and embeds their text, and
-# upserts the result into the order_chunks table that main.py queries.
-# Each PDF is one order; the order_id is taken from its filename.
-#
-# Run with: python ingestion.py [--dir data/orders]
+"""Reads order PDFs from a directory, chunks and embeds their text, and
+upserts the result into the order_chunks table that main.py queries.
+
+Each PDF is treated as one order; the order ID is derived from its filename.
+
+Run with: python ingestion.py [--dir data/orders]
+"""
 
 import argparse
 import os
 import re
 from pathlib import Path
-
-from dotenv import load_dotenv
-
-load_dotenv()  # must run before anything reads env vars
 
 import psycopg2
 from psycopg2.extras import Json
@@ -21,11 +18,10 @@ from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
+from config import DATABASE_URL, EMBEDDING_MODEL, OPENAI_API_KEY
 
-EMBEDDING_MODEL = "text-embedding-3-small"
-EMBEDDING_DIM = 1536
+SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 EMBED_BATCH_SIZE = 100
@@ -49,7 +45,11 @@ def extract_pages(path: Path) -> list:
 
 
 def chunk_pdf(path: Path) -> list:
-    """Returns a list of {order_id, content, metadata} dicts for one PDF."""
+    """Returns a list of {order_id, content, metadata} dicts for one PDF.
+
+    Order-level fields (e.g. source_file) live in the `orders` table instead
+    of being repeated in every chunk's metadata — see upsert_order().
+    """
     order_id = order_id_from_filename(path)
     chunks = []
     for page_num, page_text in enumerate(extract_pages(path), start=1):
@@ -61,7 +61,6 @@ def chunk_pdf(path: Path) -> list:
                     "order_id": order_id,
                     "content": piece,
                     "metadata": {
-                        "source_file": path.name,
                         "page": page_num,
                         "chunk_index": i,
                     },
@@ -71,24 +70,24 @@ def chunk_pdf(path: Path) -> list:
 
 
 def ensure_schema(conn):
+    """Applies schema.sql, the canonical source of truth for the DB structure."""
     with conn.cursor() as cur:
-        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS order_chunks (
-                id SERIAL PRIMARY KEY,
-                order_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                metadata JSONB,
-                embedding vector({EMBEDDING_DIM})
-            );
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS order_chunks_order_id_idx "
-            "ON order_chunks (order_id);"
-        )
+        cur.execute(SCHEMA_PATH.read_text())
     conn.commit()
+
+
+def upsert_order(conn, order_id: str, source_file: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO orders (order_id, source_file, ingested_at)
+            VALUES (%s, %s, now())
+            ON CONFLICT (order_id) DO UPDATE
+                SET source_file = EXCLUDED.source_file,
+                    ingested_at = EXCLUDED.ingested_at;
+            """,
+            (order_id, source_file),
+        )
 
 
 def embed_texts(texts: list) -> list:
@@ -107,6 +106,8 @@ def ingest_file(conn, path: Path) -> int:
 
     order_id = chunks[0]["order_id"]
     vectors = embed_texts([c["content"] for c in chunks])
+
+    upsert_order(conn, order_id, path.name)
 
     with conn.cursor() as cur:
         cur.execute("DELETE FROM order_chunks WHERE order_id = %s;", (order_id,))
